@@ -1,0 +1,513 @@
+import os
+import os.path as osp
+from glob import glob
+from torch.utils.data import Dataset
+import numpy as np
+import torch
+from functools import partial
+import torch.nn.functional as F
+from sklearn.decomposition import PCA
+import pickle
+import matplotlib.pyplot as plt
+from scipy.stats import sem
+
+import torch
+import torch.nn as nn
+
+from math import exp
+from torch.autograd import Variable
+
+
+class CTDataset(Dataset):
+    def __init__(self, dataset, mode, test_id=9, dose=5, context=True, pca_components=4096, pca_save_dir='./pca_transformed'):
+        self.mode = mode
+        self.context = context
+        self.pca_save_dir = pca_save_dir
+        self.pca_components = pca_components
+        self.pca_path = 'pca_model.pkl'
+        self.pca_model = None
+        self.original_shapes = None # original image shape
+        self.block_size = 64
+
+        if not osp.exists(self.pca_save_dir):
+            os.makedirs(self.pca_save_dir)
+
+        if dataset in ['mayo_2016_sim', 'mayo_2016']:
+            if dataset == 'mayo_2016_sim':
+                data_root = './data_preprocess/gen_data/mayo_2016_sim_npy'
+            elif dataset == 'mayo_2016':
+                data_root = './data_preprocess/gen_data/mayo_2016_npy'
+
+            patient_ids = [67, 96, 109, 143, 192, 286, 291, 310, 333, 506]
+            if mode == 'train':
+                patient_ids.pop(test_id)
+            elif mode == 'test':
+                patient_ids = patient_ids[test_id:test_id + 1]
+
+            # Storing full dose images
+            base_target = []
+            for id in patient_ids:
+                target_list = sorted(glob(osp.join(data_root, f'L{id:03d}_target_*_img.npy')))
+                base_target.extend(target_list[1:-1])
+
+            # Storing low-dose images the same way, hence why its called full
+            base_input_full = []
+            for id in patient_ids:
+                input_list = sorted(glob(osp.join(data_root, f'L{id:03d}_{dose}_*_img.npy')))
+                base_input_full.extend(input_list[1:-1])
+        
+        elif dataset == 'mayo_2020':
+            data_root = './data_preprocess/gen_data/mayo_2020_npy'
+            if dose == 10:
+                patient_ids = ['C052', 'C232', 'C016', 'C120', 'C050']
+            elif dose == 25:
+                patient_ids = ['L077', 'L056', 'L186', 'L006', 'L148']
+
+            patient_lists = []
+            for ind, id in enumerate(patient_ids):
+                patient_list = sorted(glob(osp.join(data_root, (id + '_target_' + '*_img.npy'))))
+                patient_lists = patient_lists + patient_list[1:len(patient_list) - 1]
+            base_target = patient_lists
+
+            patient_lists = []
+            for ind, id in enumerate(patient_ids):
+                patient_list = sorted(glob(osp.join(data_root, (id + '_{}_'.format(dose) + '*_img.npy'))))
+                if context:
+                    cat_patient_list = []
+                    for i in range(1, len(patient_list) - 1):
+                        patient_path = ''
+                        for j in range(-1, 2):
+                            patient_path = patient_path + '~' + patient_list[i + j]
+                        cat_patient_list.append(patient_path)
+                    patient_lists = patient_lists + cat_patient_list
+                else:
+                    patient_list = patient_list[1:len(patient_list) - 1]
+                    patient_lists = patient_lists + patient_list
+                base_input = patient_lists
+
+        elif dataset == 'piglet':
+            data_root = './data_preprocess/gen_data/piglet_npy'
+
+            patient_list = sorted(glob(osp.join(data_root, 'piglet_target_' + '*_img.npy')))
+            base_target = patient_list[1:len(patient_list) - 1]
+
+            patient_list = sorted(glob(osp.join(data_root, 'piglet_{}_'.format(dose) + '*_img.npy')))
+            if context:
+                cat_patient_list = []
+                for i in range(1, len(patient_list) - 1):
+                    patient_path = ''
+                    for j in range(-1, 2):
+                        patient_path = patient_path + '~' + patient_list[i + j]
+                    cat_patient_list.append(patient_path)
+                    base_input = cat_patient_list
+            else:
+                patient_list = patient_list[1:len(patient_list) - 1]
+                base_input = patient_list
+
+
+        elif dataset == 'phantom':
+            data_root = './data_preprocess/gen_data/xnat_npy'
+
+            patient_list = sorted(glob(osp.join(data_root, 'xnat_target' + '*_img.npy')))[9:21]
+            base_target = patient_list[1:len(patient_list) - 1]
+
+            patient_list = sorted(glob(osp.join(data_root, 'xnat_{:0>3d}_'.format(dose) + '*_img.npy')))[9:21]
+            if context:
+                cat_patient_list = []
+                for i in range(1, len(patient_list) - 1):
+                    patient_path = ''
+                    for j in range(-1, 2):
+                        patient_path = patient_path + '~' + patient_list[i + j]
+                    cat_patient_list.append(patient_path)
+                    base_input = cat_patient_list
+            else:
+                patient_list = patient_list[1:len(patient_list) - 1]
+                base_input = patient_list
+        
+        self.target = base_target  # Paths to full-dose targets
+        self.input_full = base_input_full  # Paths to low-dose inputs
+
+        print(len(self.input_full))
+        print(len(self.target))
+
+        # PCA Setup
+        if mode == 'train':
+            # Fit PCA model on the entire full dose input dataset as a whole
+            all_targets = [self.normalize_(np.load(path).astype(np.float32)) for path in self.target]
+            all_targets_stacked = np.stack(all_targets, axis=0)
+            print(f"[DEBUG] all_targets_stacked shape: {all_targets_stacked.shape}")
+
+            # Fit the new PCA model using block-wise PCA
+            self.pca_model = self.fit_pca_on_blocks(all_targets_stacked, self.block_size, self.pca_components)
+
+            # Save the PCA model
+            with open(self.pca_path, 'wb') as f:
+                pickle.dump(self.pca_model, f)
+            
+            # Generate and save CPV plot
+            self.plot_cpv_vs_components(prefix=f'{self.mode}_pca')
+
+        else:
+            with open(self.pca_path, 'rb') as f:
+                self.pca_model = pickle.load(f)
+        
+        # Apply PCA transformation to the entire input and target datasets
+        self.input_transformed_paths = self.save_pca_transformed_data(self.input_full, "input")
+        self.target_transformed_paths = self.save_pca_transformed_data(self.target, "target")
+        
+        print(f"[DEBUG] Now trying to inverse...")
+        
+        # Save inverse PCA reconstruction for debugging AFTER paths are obtained
+        self.save_inverse_pca_reconstruction(self.input_transformed_paths, self.original_shapes, prefix="input", mode=self.mode)
+        print(f"[DEBUG] Input (low dose).")
+        
+        self.save_inverse_pca_reconstruction(self.target_transformed_paths, self.original_shapes, prefix="target", mode=self.mode)
+        print(f"[DEBUG] Target (high dose).")
+           
+
+    def normalize_(self, img, MIN_B=-1024, MAX_B=3072):
+        """Normalize the image with a specified range."""
+        img = img - 1024
+        img[img < MIN_B] = MIN_B
+        img[img > MAX_B] = MAX_B
+        img = (img - MIN_B) / (MAX_B - MIN_B)
+        return img
+    
+    def plot_cpv_vs_components(self, save_dir='./pca_plots', prefix='pca'):
+        """Plots CPV vs. number of components and saves the plot."""
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        explained_variance = self.pca_model.explained_variance_ratio_
+        cpv = np.cumsum(explained_variance) * 100  # Convert to percentage
+
+        # Plot CPV
+        plt.figure(figsize=(8, 6))
+        plt.plot(range(1, len(cpv) + 1), cpv, marker='o', linestyle='-')
+        plt.xlabel('Number of Principal Components')
+        plt.ylabel('Cumulative Percentage Variance Explained (%)')
+        plt.title('CPV vs Number of Principal Components')
+        plt.grid(True)
+        plt.tight_layout()
+
+        # Save plot
+        save_path = osp.join(save_dir, f'{prefix}_cpv_plot.png')
+        plt.savefig(save_path)
+        plt.close()
+        print(f"CPV plot saved at: {save_path}")
+    
+    def divide_into_blocks(self, image, block_size):
+        """Divide an image into 8x8 blocks."""
+        h, w = image.shape
+        blocks = [
+            image[i:i + self.block_size, j:j + self.block_size].reshape(-1)
+            for i in range(0, h, block_size)
+            for j in range(0, w, block_size)
+        ]
+        return np.array(blocks)
+        
+    def fit_pca_on_blocks(self, images, block_size, n_components):
+        """Fit the PCA model using 8x8 blocks from images."""
+        # Divide the image into blocks
+        # blocks = [self.divide_into_blocks(image, block_size) for image in images]
+
+        # Flatten the blocks into 2D array for PCA fitting
+        # flattened_blocks = np.vstack([block.reshape(-1) for block in blocks])
+        # print(f"[DEBUG] flattened_blocks shape: {flattened_blocks.shape}")
+
+        # Fit PCA model on the flattened blocks
+        pca = PCA(n_components=n_components)
+                
+        all_blocks = np.concatenate(
+            [self.divide_into_blocks(image, block_size) for image in images],
+            axis=0
+        )
+        print(f"[DEBUG] All blocks shape: {all_blocks.shape}")
+        pca.fit(all_blocks)
+        
+        # for first slice only:
+        # first_slice_blocks = self.divide_into_blocks(images[0], block_size)
+        # print(f"[DEBUG] first_slice_blocks shape: {first_slice_blocks.shape}")
+        # pca.fit(first_slice_blocks)
+
+        return pca
+        
+    # Function to reassemble blocks into the original image shape
+    def reassemble_blocks(self, blocks, original_shape, block_size):
+        _, h, w = original_shape
+        reassembled = np.zeros((h, w), dtype=blocks.dtype)
+        idx = 0
+        for i in range(0, h, block_size):
+            for j in range(0, w, block_size):
+                reassembled[i:i + block_size, j:j + block_size] = blocks[idx].reshape(block_size, block_size)
+                idx += 1
+        return reassembled
+
+    def save_pca_transformed_data(self, file_paths, prefix):
+        """Transform the entire dataset with PCA and save as .npy files."""
+        
+        # Variance explained by PCA
+        explained_variance = self.pca_model.explained_variance_ratio_
+        total_variance_explained = explained_variance.sum()
+        print(f"Total explained variance: {total_variance_explained}")
+        
+        # Load and normalize all images
+        all_images = [self.normalize_(np.load(path).astype(np.float32)) for path in file_paths]
+        all_images_stacked = np.stack(all_images, axis=0)
+        
+        self.original_shapes = all_images_stacked.shape  # (num_slices, height, width)
+        print(f"[DEBUG] Original shape: {self.original_shapes}")
+        
+        # Iterate slices and divide into blocks
+        transformed_data = []
+        for slice_idx in range(all_images_stacked.shape[0]):
+            original_slice = all_images_stacked[slice_idx]
+        
+            # Divide the slice into 8x8 blocks
+            blocks = self.divide_into_blocks(original_slice, self.block_size)
+            
+            # Apply PCA to reduce dimensions
+            reduced_blocks = self.pca_model.transform(blocks)  # Apply the previously fitted PCA
+            
+            # Reshape PCA output into 3D structures (256x256)
+            flattened = reduced_blocks.flatten() # Flatten into 1D array
+            side_length = int(np.sqrt(flattened.size)) # Calculate new dimensions (256x256)
+            compressed_image = flattened.reshape(side_length, side_length) # Reshape to 256x256
+            transformed_data.append(compressed_image)
+        
+        
+        # NEW!!
+            
+        # Save transformed data
+        transformed_paths = []
+        for idx, transformed_img in enumerate(transformed_data):
+            save_path = osp.join(self.pca_save_dir, f"{prefix}_{idx:04d}.npy")
+            np.save(save_path, transformed_img)
+            transformed_paths.append(save_path)
+
+        return transformed_paths
+
+    def create_context_paths(self, transformed_paths):
+        """Create context paths by grouping neighboring slices."""
+        context_paths = []
+        for i in range(len(transformed_paths)):
+            group = [
+                transformed_paths[max(0, i - 1)],  # Previous slice or first slice
+                transformed_paths[i],             # Current slice
+                transformed_paths[min(len(transformed_paths) - 1, i + 1)]  # Next slice or last slice
+            ]
+            context_paths.append(group)
+        return context_paths
+
+# NEW!!!! down
+    # denormalize to [0, 255] for calculating PSNR, SSIM and RMSE
+    def transfer_calculate_window(self, img, MIN_B=-1024, MAX_B=3072, cut_min=-1000, cut_max=1000):
+        
+        img = img * (MAX_B - MIN_B) + MIN_B
+        img[img < cut_min] = cut_min
+        img[img > cut_max] = cut_max
+        img = 255 * (img - cut_min) / (cut_max - cut_min)
+        
+        return img
+        
+    def save_inverse_pca_reconstruction(self, transformed_data, original_shape, prefix, mode, save_dir='./pca_reconstructed'):
+        """Reconstruct images from PCA, save them, and compute quality metrics."""
+        
+        # Ensure directories exist for low-dose and high-dose reconstructions
+        recon_dir = os.path.join(save_dir, prefix)  # Creates a separate directory for input and target (low and high dose)
+        os.makedirs(recon_dir, exist_ok=True)
+        
+        reconstructed_paths = []
+        
+        # Convert transformed data into a numpy array for processing
+        transformed_data = np.array(transformed_data)
+        
+        for slice_idx in range(transformed_data.shape[0]):
+            compressed_slice = transformed_data[slice_idx]
+            
+            # For low-dose (input) or high-dose (target), handle them separately
+            if prefix == "input":
+                # Load the corresponding low-dose transformed data
+                compressed_slice_low = np.load(self.input_transformed_paths[slice_idx])
+                flattened_low = compressed_slice_low.flatten().reshape(-1, self.pca_components)
+                reconstructed_blocks = self.pca_model.inverse_transform(flattened_low)
+                
+            elif prefix == "target":
+                # Load the corresponding high-dose transformed data
+                compressed_slice_full = np.load(self.target_transformed_paths[slice_idx])
+                flattened_full = compressed_slice_full.flatten().reshape(-1, self.pca_components)
+                reconstructed_blocks = self.pca_model.inverse_transform(flattened_full)
+            
+            # Reassemble the blocks into full images
+            reconstructed_slice = self.reassemble_blocks(reconstructed_blocks, original_shape, self.block_size)
+            
+            # Save the reconstructed images
+            save_path = os.path.join(recon_dir, f"{prefix}_{slice_idx:04d}.npy")
+            np.save(save_path, reconstructed_slice)
+            reconstructed_paths.append(save_path)
+        
+        # Initialize metrics storage
+        psnr_list, ssim_list, rmse_list = [], [], []
+    
+        for idx, target_path in enumerate(self.target):
+            # Load original (full-dose) image
+            original_full = np.load(target_path).astype(np.float32)
+            # Load corresponding low-dose image
+            low_dose_path = self.input_full[idx]
+            original_low = np.load(low_dose_path).astype(np.float32)
+    
+            original_full = self.normalize_(original_full)
+            original_low = self.normalize_(original_low)
+    
+            # Load reconstructed image based on the prefix
+            if prefix == "input":
+                reconstructed_image = np.load(reconstructed_paths[idx]).astype(np.float32)
+                original_image = original_low  # Low-dose image for "input"
+            elif prefix == "target":
+                reconstructed_image = np.load(reconstructed_paths[idx]).astype(np.float32)
+                original_image = original_full  # High-dose image for "target"
+    
+            # Apply transfer_calculate_window
+            reconstructed_image = self.transfer_calculate_window(reconstructed_image)
+            original_image = self.transfer_calculate_window(original_image)
+    
+            # Compute metrics
+            data_range = original_image.max() - original_image.min()
+            psnr_score, ssim_score, rmse_score = self.compute_measure(original_image, reconstructed_image, data_range)
+    
+            # Store metrics
+            psnr_list.append(psnr_score)
+            ssim_list.append(ssim_score)
+            rmse_list.append(rmse_score)
+            
+        psnr_mean, psnr_std, psnr_ci = self.compute_stats(psnr_list)
+        ssim_mean, ssim_std, ssim_ci = self.compute_stats(ssim_list)
+        rmse_mean, rmse_std, rmse_ci = self.compute_stats(rmse_list)
+
+        # Log results
+        if prefix == "input":
+            print(f"For low dose: PSNR: {psnr_mean:.4f} +/- {psnr_ci:.4f} (std: {psnr_std:.4f}), "
+                  f"SSIM: {ssim_mean:.4f} +/- {ssim_ci:.4f} (std: {ssim_std:.4f}), "
+                  f"RMSE: {rmse_mean:.4f} +/- {rmse_ci:.4f} (std: {rmse_std:.4f})")
+        elif prefix == "target":
+            print(f"For high dose: PSNR: {psnr_mean:.4f} +/- {psnr_ci:.4f} (std: {psnr_std:.4f}), "
+                  f"SSIM: {ssim_mean:.4f} +/- {ssim_ci:.4f} (std: {ssim_std:.4f}), "
+                  f"RMSE: {rmse_mean:.4f} +/- {rmse_ci:.4f} (std: {rmse_std:.4f})")
+
+
+# NEW!!! ^
+
+    def __getitem__(self, index):
+        if self.context:
+            input_paths = self.input_context_paths[index]
+            
+            # Load and concatenate slices along axis 0
+            inputs = [np.load(path)[np.newaxis, ...].astype(np.float32) for path in input_paths]
+            input = np.concatenate(inputs, axis=0)  # Shape: (3, H, W)
+        else:
+            input_path = self.input_context_paths[index]
+            input = np.load(input_path)[np.newaxis, ...].astype(np.float32)  # Shape: (1, H, W)
+    
+        # Load target and ensure proper shape
+        target_path = self.target_transformed_paths[index]
+        target = np.load(target_path)[np.newaxis, ...].astype(np.float32)  # Shape: (1, H, W)
+            
+        return input, target
+
+    def __len__(self):
+        return len(self.target_transformed_paths)
+        
+# compute metrics
+    
+    def compute_MSE(self, img1, img2):
+        return ((img1/1.0 - img2/1.0) ** 2).mean()
+    
+    
+    def compute_RMSE(self, img1, img2):
+        img1 = img1 * 2000 / 255 - 1000
+        img2 = img2 * 2000 / 255 - 1000
+        if type(img1) == torch.Tensor:
+            return torch.sqrt(self.compute_MSE(img1, img2)).item()
+        else:
+            return np.sqrt(self.compute_MSE(img1, img2))
+    
+    
+    def compute_PSNR(self, img1, img2, data_range):
+        if type(img1) == torch.Tensor:
+            mse_ = self.compute_MSE(img1, img2)
+            return 10 * torch.log10((data_range ** 2) / mse_).item()
+        else:
+            mse_ = self.compute_MSE(img1, img2)
+            return 10 * np.log10((data_range ** 2) / mse_)
+    
+    
+    def compute_SSIM(self, img1, img2, data_range, window_size=11, channel=1, size_average=True):
+        # referred from https://github.com/Po-Hsun-Su/pytorch-ssim
+        if len(img1.shape) == 2:
+            h, w = img1.shape
+            if type(img1) == torch.Tensor:
+                img1 = img1.view(1, 1, h, w)
+                img2 = img2.view(1, 1, h, w)
+            else:
+                img1 = torch.from_numpy(img1[np.newaxis, np.newaxis, :, :])
+                img2 = torch.from_numpy(img2[np.newaxis, np.newaxis, :, :])
+        window = self.create_window(window_size, channel)
+        window = window.type_as(img1)
+    
+        mu1 = F.conv2d(img1, window, padding=window_size//2)
+        mu2 = F.conv2d(img2, window, padding=window_size//2)
+        mu1_sq, mu2_sq = mu1.pow(2), mu2.pow(2)
+        mu1_mu2 = mu1*mu2
+    
+        sigma1_sq = F.conv2d(img1*img1, window, padding=window_size//2) - mu1_sq
+        sigma2_sq = F.conv2d(img2*img2, window, padding=window_size//2) - mu2_sq
+        sigma12 = F.conv2d(img1*img2, window, padding=window_size//2) - mu1_mu2
+    
+        C1, C2 = (0.01*data_range)**2, (0.03*data_range)**2
+        #C1, C2 = 0.01**2, 0.03**2
+    
+        ssim_map = ((2*mu1_mu2+C1)*(2*sigma12+C2)) / ((mu1_sq+mu2_sq+C1)*(sigma1_sq+sigma2_sq+C2))
+        # if size_average:
+        #     return ssim_map.mean().item()
+        # else:
+        #     return ssim_map.mean(1).mean(1).mean(1).item()
+        if size_average:
+            return ssim_map.mean().item()
+        else:
+            return ssim_map.mean(1).mean(1).mean(1).item()
+    
+    
+    def gaussian(self, window_size, sigma):
+        gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
+        return gauss / gauss.sum()
+    
+    
+    def create_window(self, window_size, channel):
+        _1D_window = self.gaussian(window_size, 1.5).unsqueeze(1)
+        _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+        window = Variable(_2D_window.expand(channel, 1, window_size, window_size).contiguous())
+        return window
+        
+    def compute_measure(self, y, pred, data_range):
+        psnr = self.compute_PSNR(pred, y, data_range)
+        ssim = self.compute_SSIM(pred, y, data_range)
+        rmse = self.compute_RMSE(pred, y)
+        return psnr, ssim, rmse
+
+    # Compute mean, std deviation, and confidence intervals
+    def compute_stats(self, metric_list):
+        mean = np.mean(metric_list)
+        std_dev = np.std(metric_list, ddof=1)  # Sample standard deviation
+        conf_interval = 1.96 * sem(metric_list)  # 95% confidence interval
+        return mean, std_dev, conf_interval
+
+# metrics
+
+dataset_dict = {
+    'train': partial(CTDataset, dataset='mayo_2016_sim', mode='train', test_id=9, dose=5, context=True),
+    'mayo_2016_sim': partial(CTDataset, dataset='mayo_2016_sim', mode='test', test_id=9, dose=5, context=True),
+    'mayo_2016': partial(CTDataset, dataset='mayo_2016', mode='test', test_id=9, dose=25, context=True),
+    'mayo_2020': partial(CTDataset, dataset='mayo_2020', mode='test', test_id=None, dose=None, context=True),
+    'piglet': partial(CTDataset, dataset='piglet', mode='test', test_id=None, dose=None, context=True),
+    'phantom': partial(CTDataset, dataset='phantom', mode='test', test_id=None, dose=108, context=True),
+}
