@@ -1,5 +1,7 @@
 This repositry contains code from my MSc thesis project, "Opportunities And Challenges In Low Dose CT Imaging: A PCA Based Latent Diffusion Approach".
 
+This work is based on the state-of-the-art model [CoreDiff](https://github.com/qgao21/CoreDiff), thank you for open-sourcing.
+
 <b> Abstract </b>
 
 <p align="justify">
